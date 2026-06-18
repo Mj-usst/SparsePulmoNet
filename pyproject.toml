@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparsepulmonet"
+version = "0.1.0"
+description = "CRATE-based multimodal framework for OSIC IPF FVC progression prediction"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "SparsePulmoNet authors"}]
+dependencies = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scikit-learn>=1.2",
+  "pydicom>=2.4",
+  "opencv-python-headless>=4.8",
+  "einops>=0.7",
+  "tqdm>=4.66",
+  "matplotlib>=3.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
