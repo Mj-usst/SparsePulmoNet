@@ -1,0 +1,6 @@
+SparsePulmoNet includes an adapted CRATE/Coding RAte reduction TransformEr image encoder.
+The CRATE implementation is derived from the public MIT-licensed CRATE repository uploaded by the authors.
+The original CRATE license is preserved in third_party/CRATE_LICENSE.
+
+This code package is intended to make the SparsePulmoNet manuscript reproducible at the implementation level.
+It does not redistribute the OSIC dataset. Users must download the dataset from the official Kaggle competition page and comply with its terms.
