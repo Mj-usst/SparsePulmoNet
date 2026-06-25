@@ -2,10 +2,11 @@
 
 SparsePulmoNet is a CRATE-based multimodal framework for CT-based prediction of idiopathic pulmonary fibrosis (IPF) progression on the public OSIC Pulmonary Fibrosis Progression dataset.
 
-The code follows the manuscript implementation as closely as possible:
+The code follows the manuscript implementation:
 
 - **Dataset**: OSIC `train.csv` + baseline chest CT DICOM folders.
 - **Patient-level target**: ordinary-least-squares FVC slope from longitudinal FVC records.
+- **Preprocessing**: DICOM-to-HU conversion, denoising, isotropic 3D resampling, lung-window clipping, threshold/morphology lung-mask segmentation, masked lung input, and spatial resizing.
 - **Image branch**: CRATE/Coding RAte reduction TransformEr with MSSA-style attention and ISTA-style sparse-coding blocks.
 - **Tabular branch**: age, sex, smoking status, and selected radiomics features.
 - **Fusion**: VAE-style multimodal fusion with reconstruction and KL regularization.
@@ -16,22 +17,29 @@ The code follows the manuscript implementation as closely as possible:
 ## Repository structure
 
 ```text
-SparsePulmoNet_OpenSource/
+SparsePulmoNet/
 ├── src/sparsepulmonet/
 │   ├── config.py
-│   ├── data/osic.py
-│   ├── models/crate_backbone.py
-│   ├── models/fusion.py
-│   ├── models/ipf_model.py
-│   ├── training/engine.py
-│   ├── training/metrics.py
+│   ├── data/
+│   │   ├── osic.py
+│   │   └── preprocessing.py
+│   ├── models/
+│   │   ├── baseline_backbones.py
+│   │   ├── crate_backbone.py
+│   │   ├── fusion.py
+│   │   └── ipf_model.py
+│   ├── training/
+│   │   ├── engine.py
+│   │   └── metrics.py
 │   └── utils/layerwise.py
 ├── scripts/
 │   ├── train_osic.py
 │   ├── evaluate_checkpoint.py
 │   ├── analyze_layerwise.py
 │   ├── extract_radiomics.py
-│   └── select_lasso_features.py
+│   ├── select_lasso_features.py
+│   ├── run_ablation_inputs.py
+│   └── run_ablation_fusion_backbones.py
 ├── tests/test_forward.py
 ├── requirements.txt
 ├── pyproject.toml
@@ -76,7 +84,8 @@ The default selected feature names match the manuscript:
 ## Installation
 
 ```bash
-cd SparsePulmoNet_OpenSource
+git clone https://github.com/Mj-usst/SparsePulmoNet.git
+cd SparsePulmoNet
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -89,15 +98,16 @@ Optional radiomics extraction requires:
 pip install pyradiomics SimpleITK
 ```
 
-## Train five-fold OSIC model
+## Main model training
 
-The default training command uses the manuscript-style settings: five-fold CV, batch size 4, AdamW, learning rate `5e-5`, and 400 epochs.
+The default training command uses the manuscript-style settings: five-fold CV, batch size 4, AdamW, learning rate `5e-5`, and 400 epochs. By default, preprocessing includes denoising, isotropic resampling, and lung-mask segmentation.
 
 ```bash
 python scripts/train_osic.py \
   --data-root /path/to/osic \
   --radiomics-csv /path/to/selected_radiomics.csv \
   --model-name crate_tiny \
+  --fusion-type vae \
   --image-size 512 \
   --batch-size 4 \
   --epochs 400 \
@@ -111,17 +121,92 @@ Outputs:
 outputs/sparsepulmonet_osic/
 ├── run_config.json
 ├── fold_summary.json
-├── crate_tiny_fold0.pt
-├── crate_tiny_fold1.pt
+├── crate_tiny_vae_fold0.pt
+├── crate_tiny_vae_fold1.pt
 ├── ...
+├── preprocessed_cache/
 └── cv_summary.json
+```
+
+## Manuscript preprocessing
+
+The model input preprocessing is implemented in `src/sparsepulmonet/data/preprocessing.py` and includes:
+
+1. DICOM series sorting by spatial position or instance number.
+2. Conversion to HU with `RescaleSlope` and `RescaleIntercept`.
+3. Slice-wise median denoising.
+4. Optional 3D isotropic resampling to 1.0 mm spacing.
+5. Threshold/morphology lung-mask segmentation.
+6. Lung-window clipping with WW/WL = 1600/-600 HU and normalization to `[0, 1]`.
+7. Optional lung-mask application to suppress non-lung regions.
+8. Spatial resizing to `image_size × image_size`.
+9. Middle-lung slice selection after excluding the apical and basal 30% of slices.
+
+Useful switches:
+
+```bash
+--disable-denoising
+--disable-lung-mask
+--disable-isotropic-resampling
+--do-not-apply-lung-mask-to-image
+--target-spacing-mm 1.0
+--preprocessed-cache-dir outputs/preprocessed_cache
+```
+
+## Table 3: input-combination ablation
+
+This script runs the three input settings reported in Table 3:
+
+- image-only
+- image + clinical
+- image + clinical + radiomics
+
+```bash
+python scripts/run_ablation_inputs.py \
+  --data-root /path/to/osic \
+  --radiomics-csv /path/to/selected_radiomics.csv \
+  --save-root outputs/table3_input_ablation \
+  --model-name crate_tiny \
+  --fusion-type vae \
+  --epochs 400 \
+  --batch-size 4 \
+  --folds 5
+```
+
+The script writes:
+
+```text
+outputs/table3_input_ablation/table3_input_ablation_summary.csv
+```
+
+## Table 5: fusion and backbone ablation
+
+This script runs fusion ablations and backbone ablations:
+
+- fusion: concat, attention, VAE
+- backbone: ResNet, ResNeXt, EfficientNet, CRATE
+
+```bash
+python scripts/run_ablation_fusion_backbones.py \
+  --data-root /path/to/osic \
+  --radiomics-csv /path/to/selected_radiomics.csv \
+  --save-root outputs/table5_fusion_backbone_ablation \
+  --epochs 400 \
+  --batch-size 4 \
+  --folds 5
+```
+
+The script writes:
+
+```text
+outputs/table5_fusion_backbone_ablation/table5_fusion_backbone_ablation_summary.csv
 ```
 
 ## Evaluate a checkpoint
 
 ```bash
 python scripts/evaluate_checkpoint.py \
-  --checkpoint outputs/sparsepulmonet_osic/crate_tiny_fold0.pt \
+  --checkpoint outputs/sparsepulmonet_osic/crate_tiny_vae_fold0.pt \
   --data-root /path/to/osic \
   --radiomics-csv /path/to/selected_radiomics.csv \
   --fold 0
@@ -133,7 +218,7 @@ This script computes the coding-rate proxy at the post-MSSA stage and the zero/n
 
 ```bash
 python scripts/analyze_layerwise.py \
-  --checkpoint outputs/sparsepulmonet_osic/crate_tiny_fold0.pt \
+  --checkpoint outputs/sparsepulmonet_osic/crate_tiny_vae_fold0.pt \
   --data-root /path/to/osic \
   --radiomics-csv /path/to/selected_radiomics.csv \
   --fold 0 \
@@ -143,7 +228,7 @@ python scripts/analyze_layerwise.py \
 
 ## Radiomics workflow
 
-To extract radiomics features from DICOM folders using a lightweight threshold-based lung mask:
+To extract radiomics features from DICOM folders using a threshold/morphology lung mask:
 
 ```bash
 python scripts/extract_radiomics.py \
@@ -173,11 +258,11 @@ python scripts/select_lasso_features.py \
 ## Important reproducibility notes
 
 1. No patients are excluded by default. If corrupted or incomplete cases must be excluded, pass `--exclude-patient-ids` and report the final patient count in the manuscript.
-2. DICOM pixels are converted to HU using `RescaleSlope` and `RescaleIntercept`, then clipped to WW/WL = 1600/-600 HU and normalized to `[0, 1]`.
+2. DICOM pixels are converted to HU using `RescaleSlope` and `RescaleIntercept`, denoised, optionally isotropically resampled, segmented by a lung mask, clipped to WW/WL = 1600/-600 HU, and normalized to `[0, 1]`.
 3. Training samples use a random slice from the middle 40% of each CT scan; validation samples use the center slice from that same middle region.
 4. The model predicts a patient-specific FVC slope. Visit-level FVC is reconstructed from the observed baseline FVC closest to week 0.
 5. Because this implementation predicts point estimates, LLLm uses a fixed uncertainty of 70 mL by default. If the manuscript uses another uncertainty definition, this must be reported and implemented explicitly.
-6. The VAE fusion module is trained with both reconstruction and KL terms by default (`--recon-weight 1.0`, `--kl-weight 1e-4`).
+6. The VAE fusion module is trained with both reconstruction and KL terms by default (`--recon-weight 1.0`, `--kl-weight 1e-4`). These losses are automatically disabled for concat/attention fusion ablations.
 
 ## Citation
 
