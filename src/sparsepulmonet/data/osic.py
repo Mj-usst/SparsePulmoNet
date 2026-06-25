@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
-import cv2
 import numpy as np
 import pandas as pd
-import pydicom
 import torch
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Dataset
 
 from sparsepulmonet.config import DataConfig
+from sparsepulmonet.data.preprocessing import middle_slice_indices, preprocess_patient_volume
 
 
 @dataclass
@@ -75,14 +73,21 @@ def baseline_from_closest_week0(patient_df: pd.DataFrame) -> Tuple[float, float]
 
 def fit_normalizers(train_df: pd.DataFrame, radiomics_df: pd.DataFrame, train_patients: Sequence[str], cfg: DataConfig) -> FoldNormalizers:
     train_rows = train_df.loc[train_df["Patient"].isin(train_patients)]
-    age_mean = float(train_rows["Age"].mean())
-    age_std = float(train_rows["Age"].std(ddof=0) or 1.0)
+    age_mean = float(train_rows["Age"].mean()) if cfg.use_clinical else 0.0
+    age_std = float(train_rows["Age"].std(ddof=0) or 1.0) if cfg.use_clinical else 1.0
 
-    rad_rows = radiomics_df.loc[radiomics_df["Patient"].isin(train_patients), cfg.radiomics_columns]
-    rad_values = rad_rows.to_numpy(dtype=np.float32)
-    rad_mean = np.nanmean(rad_values, axis=0).astype(np.float32)
-    rad_std = np.nanstd(rad_values, axis=0).astype(np.float32)
-    rad_std[rad_std == 0] = 1.0
+    if cfg.use_radiomics:
+        missing_columns = [col for col in cfg.radiomics_columns if col not in radiomics_df.columns]
+        if missing_columns:
+            raise ValueError(f"Radiomics CSV is missing selected feature columns: {missing_columns}")
+        rad_rows = radiomics_df.loc[radiomics_df["Patient"].isin(train_patients), cfg.radiomics_columns]
+        rad_values = rad_rows.to_numpy(dtype=np.float32)
+        rad_mean = np.nanmean(rad_values, axis=0).astype(np.float32)
+        rad_std = np.nanstd(rad_values, axis=0).astype(np.float32)
+        rad_std[rad_std == 0] = 1.0
+    else:
+        rad_mean = np.zeros((0,), dtype=np.float32)
+        rad_std = np.ones((0,), dtype=np.float32)
     return FoldNormalizers(age_mean=age_mean, age_std=age_std, radiomics_mean=rad_mean, radiomics_std=rad_std)
 
 
@@ -112,11 +117,8 @@ def build_patient_records(
 ) -> Dict[str, PatientRecord]:
     records: Dict[str, PatientRecord] = {}
     missing_radiomics: List[str] = []
-    missing_columns = [col for col in cfg.radiomics_columns if col not in radiomics_df.columns]
-    if missing_columns:
-        raise ValueError(f"Radiomics CSV is missing selected feature columns: {missing_columns}")
-
     excluded = set(cfg.exclude_patient_ids)
+
     for patient_id in patient_ids:
         if patient_id in excluded:
             continue
@@ -124,19 +126,25 @@ def build_patient_records(
         if patient_df.empty:
             continue
 
-        radiomics_row = radiomics_df.loc[radiomics_df["Patient"] == patient_id]
-        if radiomics_row.empty:
-            missing_radiomics.append(patient_id)
-            continue
-
         slope, _intercept = fit_patient_slope(patient_df)
         baseline_week, baseline_fvc = baseline_from_closest_week0(patient_df)
-        clinical = build_clinical_vector(patient_df, normalizers)
-        radiomics = radiomics_row[cfg.radiomics_columns].iloc[0].to_numpy(dtype=np.float32)
-        if cfg.normalize_radiomics_per_fold:
-            radiomics = (radiomics - normalizers.radiomics_mean) / normalizers.radiomics_std
-        radiomics = np.nan_to_num(radiomics, nan=0.0, posinf=0.0, neginf=0.0)
-        tabular = np.asarray(clinical + radiomics.astype(np.float32).tolist(), dtype=np.float32)
+
+        features: List[float] = []
+        if cfg.use_clinical:
+            features.extend(build_clinical_vector(patient_df, normalizers))
+
+        if cfg.use_radiomics:
+            radiomics_row = radiomics_df.loc[radiomics_df["Patient"] == patient_id]
+            if radiomics_row.empty:
+                missing_radiomics.append(patient_id)
+                continue
+            radiomics = radiomics_row[cfg.radiomics_columns].iloc[0].to_numpy(dtype=np.float32)
+            if cfg.normalize_radiomics_per_fold:
+                radiomics = (radiomics - normalizers.radiomics_mean) / normalizers.radiomics_std
+            radiomics = np.nan_to_num(radiomics, nan=0.0, posinf=0.0, neginf=0.0)
+            features.extend(radiomics.astype(np.float32).tolist())
+
+        tabular = np.asarray(features, dtype=np.float32)
         records[patient_id] = PatientRecord(
             patient_id=patient_id,
             slope=slope,
@@ -149,70 +157,19 @@ def build_patient_records(
         preview = ", ".join(missing_radiomics[:10])
         raise ValueError(
             f"Missing radiomics rows for {len(missing_radiomics)} patients. First missing IDs: {preview}. "
-            "Either provide a complete radiomics CSV or run with strict=False."
+            "Either provide a complete radiomics CSV, disable radiomics, or run with strict=False."
         )
     return records
 
 
-def _natural_key(path: Path) -> Tuple:
-    parts = re.split(r"(\d+)", path.stem)
-    return tuple(int(p) if p.isdigit() else p for p in parts)
-
-
-def list_dicom_files(patient_dir: Path) -> List[Path]:
-    if not patient_dir.exists():
-        return []
-    files = [p for p in patient_dir.iterdir() if p.is_file() and not p.name.startswith(".")]
-    if not files:
-        return []
-
-    sortable = []
-    for p in files:
-        try:
-            ds = pydicom.dcmread(str(p), stop_before_pixels=True, force=True)
-            z = getattr(ds, "ImagePositionPatient", None)
-            z_value = float(z[2]) if z is not None and len(z) >= 3 else None
-            inst = getattr(ds, "InstanceNumber", None)
-            key = (0, z_value) if z_value is not None else (1, int(inst)) if inst is not None else (2, _natural_key(p))
-        except Exception:
-            key = (2, _natural_key(p))
-        sortable.append((key, p))
-    return [p for _key, p in sorted(sortable, key=lambda item: item[0])]
-
-
-def candidate_middle_slices(slices: Sequence[Path], strip_ratio: float) -> List[Path]:
-    if not slices:
-        return []
-    strip_ratio = min(max(float(strip_ratio), 0.0), 0.49)
-    start = int(len(slices) * strip_ratio)
-    end = int(len(slices) * (1.0 - strip_ratio))
-    clipped = list(slices[start:end]) if end > start else list(slices)
-    return clipped or list(slices)
-
-
-def read_dicom_image(path: Path, cfg: DataConfig) -> np.ndarray:
-    dcm = pydicom.dcmread(str(path), force=True)
-    image = dcm.pixel_array.astype(np.float32)
-    slope = float(getattr(dcm, "RescaleSlope", 1.0))
-    intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
-    image = image * slope + intercept
-
-    if str(getattr(dcm, "PhotometricInterpretation", "MONOCHROME2")).upper() == "MONOCHROME1":
-        image = np.max(image) - image
-
-    lower = cfg.window_level - cfg.window_width / 2.0
-    upper = cfg.window_level + cfg.window_width / 2.0
-    image = np.clip(image, lower, upper)
-    image = (image - lower) / max(upper - lower, 1e-6)
-
-    if cfg.use_median_filter:
-        image = cv2.medianBlur((image * 255).astype(np.uint8), 3).astype(np.float32) / 255.0
-
-    image = cv2.resize(image, (cfg.image_size, cfg.image_size), interpolation=cv2.INTER_LINEAR)
-    return image.astype(np.float32)
-
-
 class OSICPatientDataset(Dataset):
+    """Patient-level OSIC dataset with manuscript-aligned CT preprocessing.
+
+    Each patient contributes one CT slice per epoch. Slices are selected from the
+    preprocessed middle-lung volume: random middle slice for training and center
+    middle slice for validation/evaluation.
+    """
+
     def __init__(
         self,
         patient_ids: Iterable[str],
@@ -224,37 +181,48 @@ class OSICPatientDataset(Dataset):
         self.records = records
         self.cfg = cfg
         self.mode = mode
-        self.patient_slices: Dict[str, List[Path]] = {}
+        if self.cfg.preprocessed_cache_dir is None:
+            self.cfg.preprocessed_cache_dir = self.cfg.data_root / ".sparsepulmonet_cache"
+        self.patient_slice_indices: Dict[str, List[int]] = {}
         missing_dirs: List[str] = []
 
         for patient_id in self.patient_ids:
             patient_dir = cfg.train_dir / patient_id
-            slices = candidate_middle_slices(list_dicom_files(patient_dir), cfg.strip_ratio)
-            if not slices:
+            if not patient_dir.exists():
                 missing_dirs.append(patient_id)
                 continue
-            self.patient_slices[patient_id] = slices
+            try:
+                volume, _mask = preprocess_patient_volume(patient_dir, cfg)
+                indices = middle_slice_indices(volume.shape[0], cfg.strip_ratio)
+            except Exception as exc:
+                if cfg.strict:
+                    raise RuntimeError(f"Failed to preprocess patient {patient_id}: {exc}") from exc
+                missing_dirs.append(patient_id)
+                continue
+            self.patient_slice_indices[patient_id] = indices
 
-        self.patient_ids = [pid for pid in self.patient_ids if pid in self.patient_slices and pid in self.records]
+        self.patient_ids = [pid for pid in self.patient_ids if pid in self.patient_slice_indices and pid in self.records]
         if missing_dirs and cfg.strict:
             preview = ", ".join(missing_dirs[:10])
-            raise FileNotFoundError(f"Missing/empty DICOM folders for {len(missing_dirs)} patients. First IDs: {preview}")
+            raise FileNotFoundError(f"Missing/failed DICOM preprocessing for {len(missing_dirs)} patients. First IDs: {preview}")
 
     def __len__(self) -> int:
         return len(self.patient_ids)
 
-    def _select_slice(self, patient_id: str) -> Path:
-        slices = self.patient_slices[patient_id]
+    def _select_index(self, patient_id: str) -> int:
+        indices = self.patient_slice_indices[patient_id]
         policy = self.cfg.train_slice_policy if self.mode == "train" else self.cfg.eval_slice_policy
         if policy == "random_middle":
-            return Path(np.random.choice(slices))
-        return slices[len(slices) // 2]
+            return int(np.random.choice(indices))
+        return int(indices[len(indices) // 2])
 
     def __getitem__(self, idx: int):
         patient_id = self.patient_ids[idx]
         record = self.records[patient_id]
-        dicom_path = self._select_slice(patient_id)
-        image = read_dicom_image(dicom_path, self.cfg)
+        patient_dir = self.cfg.train_dir / patient_id
+        volume, _mask = preprocess_patient_volume(patient_dir, self.cfg)
+        slice_idx = self._select_index(patient_id)
+        image = volume[slice_idx]
         image_tensor = torch.from_numpy(image).unsqueeze(0).float()
         tabular_tensor = torch.from_numpy(record.tabular).float()
         target_tensor = torch.tensor(record.slope, dtype=torch.float32)
@@ -262,7 +230,7 @@ class OSICPatientDataset(Dataset):
             "patient_id": patient_id,
             "baseline_week": record.baseline_week,
             "baseline_fvc": record.baseline_fvc,
-            "slice_path": str(dicom_path),
+            "slice_index": slice_idx,
         }
         return image_tensor, tabular_tensor, target_tensor, meta
 
@@ -274,7 +242,7 @@ def _collate(batch):
 
 def make_osic_folds(cfg: DataConfig):
     train_df = read_osic_train_csv(cfg.train_csv)
-    radiomics_df = read_radiomics_csv(cfg.radiomics_csv)
+    radiomics_df = read_radiomics_csv(cfg.radiomics_csv) if cfg.use_radiomics else pd.DataFrame({"Patient": train_df["Patient"].unique()})
     all_patients = sorted([p for p in train_df["Patient"].unique().tolist() if p not in set(cfg.exclude_patient_ids)])
     kfold = KFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.random_state)
     folds = []
@@ -320,6 +288,10 @@ def make_osic_folds(cfg: DataConfig):
                     "n_train_patients": len(train_dataset),
                     "n_val_patients": len(val_dataset),
                     "n_all_patients_in_csv": len(all_patients),
+                    "use_clinical": cfg.use_clinical,
+                    "use_radiomics": cfg.use_radiomics,
+                    "use_lung_mask": cfg.use_lung_mask,
+                    "enable_isotropic_resampling": cfg.enable_isotropic_resampling,
                     "excluded_patient_ids": list(cfg.exclude_patient_ids),
                 },
             }
