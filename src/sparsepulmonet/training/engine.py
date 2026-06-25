@@ -18,6 +18,15 @@ def reconstruction_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> to
     return torch.mean(torch.abs(reconstructed - target))
 
 
+def _vae_losses(aux: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return reconstruction/KL losses only when the fusion module is VAE-like."""
+    fused = aux["fused"]
+    if "z" not in aux:  # concat/attention/image-only ablations
+        zero = fused.sum() * 0.0
+        return zero, zero
+    return reconstruction_loss(aux["fused"], aux["combined"]), kl_divergence(aux["mu"], aux["logvar"])
+
+
 def train_one_epoch(
     model: nn.Module,
     loader,
@@ -44,8 +53,7 @@ def train_one_epoch(
         with torch.cuda.amp.autocast(enabled=use_amp):
             slope_pred, aux = model(images, tabular)
             slope_loss = reg_loss_fn(slope_pred, targets)
-            recon = reconstruction_loss(aux["fused"], aux["combined"])
-            kl = kl_divergence(aux["mu"], aux["logvar"])
+            recon, kl = _vae_losses(aux)
             loss = slope_loss_weight * slope_loss + recon_weight * recon + kl_weight * kl
 
         scaler.scale(loss).backward()
