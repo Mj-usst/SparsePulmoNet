@@ -21,10 +21,11 @@ DEFAULT_RADIOMICS_COLUMNS = [
 class DataConfig:
     """Dataset and preprocessing configuration.
 
-    The defaults follow the manuscript as closely as possible: OSIC train.csv,
-    baseline CT DICOM folders, lung windowing with WW/WL = 1600/-600 HU,
-    30% apical/basal slice removal, 5-fold cross-validation, and no default
-    patient exclusion.
+    The defaults reflect the manuscript workflow: OSIC train.csv, baseline CT
+    DICOM folders, HU conversion, lung-window preprocessing, denoising,
+    threshold/morphology lung-mask segmentation, optional isotropic 3D
+    resampling before middle-lung slice selection, 5-fold cross-validation,
+    and no default patient exclusion.
     """
 
     data_root: Path
@@ -44,7 +45,19 @@ class DataConfig:
     train_slice_policy: Literal["random_middle", "center_middle"] = "random_middle"
     eval_slice_policy: Literal["center_middle", "random_middle"] = "center_middle"
     normalize_radiomics_per_fold: bool = True
-    use_median_filter: bool = False
+    use_clinical: bool = True
+    use_radiomics: bool = True
+
+    # CT preprocessing used before 2D middle-lung slice extraction.
+    use_denoising: bool = True
+    use_lung_mask: bool = True
+    lung_mask_lower_hu: float = -1000.0
+    lung_mask_upper_hu: float = -300.0
+    lung_mask_morphology: bool = True
+    apply_lung_mask_to_image: bool = True
+    enable_isotropic_resampling: bool = True
+    target_spacing_mm: float = 1.0
+    preprocessed_cache_dir: Optional[Path] = None
     random_state: int = 42
 
     @property
@@ -57,16 +70,21 @@ class DataConfig:
 
     @property
     def clinical_feature_dim(self) -> int:
-        return 4  # age + sex + two-bit smoking status
+        return 4 if self.use_clinical else 0  # age + sex + two-bit smoking status
+
+    @property
+    def radiomics_feature_dim(self) -> int:
+        return len(self.radiomics_columns) if self.use_radiomics else 0
 
     @property
     def tabular_feature_dim(self) -> int:
-        return self.clinical_feature_dim + len(self.radiomics_columns)
+        return self.clinical_feature_dim + self.radiomics_feature_dim
 
 
 @dataclass
 class ModelConfig:
-    model_name: Literal["crate_tiny", "crate_small", "crate_base", "crate_large"] = "crate_tiny"
+    model_name: str = "crate_tiny"  # crate_tiny/small/base/large, resnet18/50, resnext50_32x4d, efficientnet_b0
+    fusion_type: Literal["vae", "concat", "attention", "image_only"] = "vae"
     image_size: int = 512
     patch_size: int = 16
     in_channels: int = 1
