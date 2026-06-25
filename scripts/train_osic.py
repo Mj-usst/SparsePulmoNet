@@ -34,7 +34,8 @@ def parse_args():
     parser.add_argument("--radiomics-csv", type=str, required=True, help="CSV containing one row per patient and selected radiomics columns")
     parser.add_argument("--save-dir", type=str, default="outputs/sparsepulmonet_osic")
 
-    parser.add_argument("--model-name", type=str, default="crate_tiny", choices=["crate_tiny", "crate_small", "crate_base", "crate_large"])
+    parser.add_argument("--model-name", type=str, default="crate_tiny", choices=["crate_tiny", "crate_small", "crate_base", "crate_large", "resnet18", "resnet50", "resnext50_32x4d", "efficientnet_b0"])
+    parser.add_argument("--fusion-type", type=str, default="vae", choices=["vae", "concat", "attention", "image_only"])
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
@@ -53,6 +54,19 @@ def parse_args():
     parser.add_argument("--fixed-sigma", type=float, default=70.0, help="Fixed FVC uncertainty used for LLLm when the model predicts point estimates only")
     parser.add_argument("--recon-weight", type=float, default=1.0)
     parser.add_argument("--kl-weight", type=float, default=1e-4)
+
+    # Table 3 input ablation switches.
+    parser.add_argument("--no-clinical", action="store_true", help="Disable age/sex/smoking clinical inputs")
+    parser.add_argument("--no-radiomics", action="store_true", help="Disable radiomics inputs")
+
+    # Manuscript preprocessing switches.
+    parser.add_argument("--disable-denoising", action="store_true")
+    parser.add_argument("--disable-lung-mask", action="store_true")
+    parser.add_argument("--disable-isotropic-resampling", action="store_true")
+    parser.add_argument("--do-not-apply-lung-mask-to-image", action="store_true")
+    parser.add_argument("--target-spacing-mm", type=float, default=1.0)
+    parser.add_argument("--preprocessed-cache-dir", type=str, default=None)
+
     parser.add_argument("--exclude-patient-ids", type=str, default=None, help="Comma-separated IDs or a text file with one patient ID per line")
     parser.add_argument("--non-strict", action="store_true", help="Skip patients with missing DICOM/radiomics instead of raising an error")
     parser.add_argument("--debug-max-folds", type=int, default=None)
@@ -65,6 +79,13 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    cache_dir = Path(args.preprocessed_cache_dir) if args.preprocessed_cache_dir else save_dir / "preprocessed_cache"
+    use_clinical = not args.no_clinical
+    use_radiomics = not args.no_radiomics
+    if args.fusion_type == "image_only":
+        use_clinical = False
+        use_radiomics = False
+
     data_cfg = DataConfig(
         data_root=Path(args.data_root),
         radiomics_csv=Path(args.radiomics_csv),
@@ -75,9 +96,18 @@ def main():
         exclude_patient_ids=_parse_patient_ids(args.exclude_patient_ids),
         strict=not args.non_strict,
         random_state=args.seed,
+        use_clinical=use_clinical,
+        use_radiomics=use_radiomics,
+        use_denoising=not args.disable_denoising,
+        use_lung_mask=not args.disable_lung_mask,
+        apply_lung_mask_to_image=not args.do_not_apply_lung_mask_to_image,
+        enable_isotropic_resampling=not args.disable_isotropic_resampling,
+        target_spacing_mm=args.target_spacing_mm,
+        preprocessed_cache_dir=cache_dir,
     )
     model_cfg = ModelConfig(
         model_name=args.model_name,
+        fusion_type=args.fusion_type,
         image_size=args.image_size,
         patch_size=args.patch_size,
         latent_dim=args.latent_dim,
@@ -105,7 +135,7 @@ def main():
     write_fold_summary(folds, save_dir / "fold_summary.json")
 
     config_json = {
-        "data_cfg": {**asdict(data_cfg), "data_root": str(data_cfg.data_root), "radiomics_csv": str(data_cfg.radiomics_csv)},
+        "data_cfg": {**asdict(data_cfg), "data_root": str(data_cfg.data_root), "radiomics_csv": str(data_cfg.radiomics_csv), "preprocessed_cache_dir": str(data_cfg.preprocessed_cache_dir)},
         "model_cfg": asdict(model_cfg),
         "train_cfg": {**asdict(train_cfg), "save_dir": str(train_cfg.save_dir), "resume": str(train_cfg.resume) if train_cfg.resume else None},
     }
@@ -121,7 +151,8 @@ def main():
 
         best_lllm = float("-inf")
         best_metrics = None
-        ckpt_path = save_dir / f"{model_cfg.model_name}_fold{fold}.pt"
+        run_name = f"{model_cfg.model_name}_{model_cfg.fusion_type}_fold{fold}"
+        ckpt_path = save_dir / f"{run_name}.pt"
 
         for epoch in range(train_cfg.epochs):
             train_metrics = train_one_epoch(
@@ -161,13 +192,18 @@ def main():
                         "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "model_cfg": asdict(model_cfg),
-                        "data_cfg": {"image_size": data_cfg.image_size, "tabular_feature_dim": data_cfg.tabular_feature_dim},
+                        "data_cfg": {
+                            "image_size": data_cfg.image_size,
+                            "tabular_feature_dim": data_cfg.tabular_feature_dim,
+                            "use_clinical": data_cfg.use_clinical,
+                            "use_radiomics": data_cfg.use_radiomics,
+                        },
                         "metrics": best_metrics,
                     },
                     ckpt_path,
                 )
         if best_metrics is not None:
-            all_results.append({"fold": fold, **best_metrics})
+            all_results.append({"fold": fold, "model_name": model_cfg.model_name, "fusion_type": model_cfg.fusion_type, "use_clinical": data_cfg.use_clinical, "use_radiomics": data_cfg.use_radiomics, **best_metrics})
             print(f"Best fold {fold}: {best_metrics}")
 
     summary_path = save_dir / "cv_summary.json"
