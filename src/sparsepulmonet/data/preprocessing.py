@@ -74,7 +74,6 @@ def denoise_volume(volume_hu: np.ndarray) -> np.ndarray:
     """Lightweight slice-wise median denoising used before windowing/masking."""
     out = np.empty_like(volume_hu, dtype=np.float32)
     for z in range(volume_hu.shape[0]):
-        # Work in int16-like HU values for numerical stability.
         out[z] = cv2.medianBlur(volume_hu[z].astype(np.float32), 3)
     return out
 
@@ -91,32 +90,61 @@ def resample_isotropic(volume: np.ndarray, spacing_zyx: Tuple[float, float, floa
         return volume
     z, y, x = spacing_zyx
     factors = (z / target_spacing, y / target_spacing, x / target_spacing)
-    # Avoid extreme accidental resampling when DICOM spacing tags are malformed.
     factors = tuple(float(np.clip(f, 0.25, 4.0)) for f in factors)
     return ndi.zoom(volume, zoom=factors, order=1).astype(np.float32)
+
+
+def _remove_border_connected_air(mask: np.ndarray) -> np.ndarray:
+    """Remove thresholded air regions connected to image borders.
+
+    This prevents the body-exterior air from being mistaken for lung when using
+    transparent HU thresholding.
+    """
+    try:
+        from scipy import ndimage as ndi
+    except Exception:
+        # Conservative fallback: drop a 2-pixel border before morphology.
+        cleaned = mask.copy()
+        cleaned[:, :2, :] = False
+        cleaned[:, -2:, :] = False
+        cleaned[:, :, :2] = False
+        cleaned[:, :, -2:] = False
+        return cleaned
+
+    labeled, n = ndi.label(mask)
+    if n == 0:
+        return mask
+    border_labels = set(np.unique(labeled[:, 0, :]).tolist())
+    border_labels.update(np.unique(labeled[:, -1, :]).tolist())
+    border_labels.update(np.unique(labeled[:, :, 0]).tolist())
+    border_labels.update(np.unique(labeled[:, :, -1]).tolist())
+    border_labels.discard(0)
+    if not border_labels:
+        return mask
+    return mask & ~np.isin(labeled, list(border_labels))
 
 
 def segment_lung_mask(volume_hu: np.ndarray, cfg: DataConfig) -> np.ndarray:
     """Threshold/morphology lung mask used in the manuscript preprocessing.
 
-    The default threshold isolates air-containing lung parenchyma and the
-    optional morphology step removes small noisy regions and fills holes. This
-    is intentionally simple and transparent; users can replace it with a more
-    advanced lung segmentation mask when available.
+    The default threshold isolates air-containing lung parenchyma. Border-
+    connected outside-body air is removed before morphology, and the largest
+    one or two internal air components are retained as lung candidates.
     """
     mask = (volume_hu >= cfg.lung_mask_lower_hu) & (volume_hu <= cfg.lung_mask_upper_hu)
+    mask = _remove_border_connected_air(mask)
     if cfg.lung_mask_morphology:
         try:
             from scipy import ndimage as ndi
 
             mask = ndi.binary_opening(mask, iterations=1)
             mask = ndi.binary_closing(mask, iterations=2)
-            mask = ndi.binary_fill_holes(mask)
             labeled, n = ndi.label(mask)
             if n > 0:
                 sizes = ndi.sum(mask, labeled, index=np.arange(1, n + 1))
                 keep = np.argsort(sizes)[-2:] + 1
                 mask = np.isin(labeled, keep)
+                mask = ndi.binary_fill_holes(mask)
         except Exception:
             pass
     return mask.astype(np.uint8)
@@ -140,7 +168,12 @@ def resize_slices(volume: np.ndarray, image_size: int) -> np.ndarray:
 def _cache_path(patient_dir: Path, cfg: DataConfig) -> Path | None:
     if cfg.preprocessed_cache_dir is None:
         return None
-    key = f"{patient_dir.resolve()}|{cfg.image_size}|{cfg.window_width}|{cfg.window_level}|{cfg.use_lung_mask}|{cfg.enable_isotropic_resampling}|{cfg.target_spacing_mm}"
+    key = (
+        f"{patient_dir.resolve()}|{cfg.image_size}|{cfg.window_width}|{cfg.window_level}|"
+        f"{cfg.use_denoising}|{cfg.use_lung_mask}|{cfg.apply_lung_mask_to_image}|"
+        f"{cfg.enable_isotropic_resampling}|{cfg.target_spacing_mm}|"
+        f"{cfg.lung_mask_lower_hu}|{cfg.lung_mask_upper_hu}"
+    )
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
     cfg.preprocessed_cache_dir.mkdir(parents=True, exist_ok=True)
     return cfg.preprocessed_cache_dir / f"{patient_dir.name}_{digest}.npz"
@@ -149,15 +182,16 @@ def _cache_path(patient_dir: Path, cfg: DataConfig) -> Path | None:
 def preprocess_patient_volume(patient_dir: Path, cfg: DataConfig) -> Tuple[np.ndarray, np.ndarray | None]:
     """Full manuscript-aligned CT preprocessing pipeline.
 
-    Steps: DICOM-to-HU conversion, optional denoising, optional isotropic 3D
-    resampling, threshold/morphology lung-mask segmentation, lung-window
-    clipping/normalization, optional lung-mask application, and spatial resizing.
+    Steps: DICOM-to-HU conversion, denoising, isotropic 3D resampling,
+    threshold/morphology lung-mask segmentation, lung-window clipping and
+    normalization, optional lung-mask application, and spatial resizing.
     """
     cache = _cache_path(patient_dir, cfg)
     if cache is not None and cache.exists():
         data = np.load(cache)
         volume = data["volume"].astype(np.float32)
-        mask = data["mask"].astype(np.uint8) if "mask" in data else None
+        mask_arr = data["mask"].astype(np.uint8) if "mask" in data else np.zeros((0,), dtype=np.uint8)
+        mask = mask_arr if mask_arr.size > 0 else None
         return volume, mask
 
     volume_hu, spacing = load_dicom_series(patient_dir)
@@ -166,14 +200,9 @@ def preprocess_patient_volume(patient_dir: Path, cfg: DataConfig) -> Tuple[np.nd
     if cfg.enable_isotropic_resampling:
         volume_hu = resample_isotropic(volume_hu, spacing, cfg.target_spacing_mm)
 
-    mask = None
-    if cfg.use_lung_mask:
-        mask = segment_lung_mask(volume_hu, cfg)
-
+    mask = segment_lung_mask(volume_hu, cfg) if cfg.use_lung_mask else None
     volume = window_normalize(volume_hu, cfg)
     if cfg.use_lung_mask and cfg.apply_lung_mask_to_image and mask is not None:
-        # Values outside lung are set to 0 after window normalization, matching a
-        # masked lung-only image input while keeping image size unchanged.
         volume = volume * mask.astype(np.float32)
 
     volume = resize_slices(volume, cfg.image_size)
@@ -182,7 +211,11 @@ def preprocess_patient_volume(patient_dir: Path, cfg: DataConfig) -> Tuple[np.nd
         mask = mask.astype(np.uint8)
 
     if cache is not None:
-        np.savez_compressed(cache, volume=volume.astype(np.float32), mask=mask.astype(np.uint8) if mask is not None else np.zeros((0,), dtype=np.uint8))
+        np.savez_compressed(
+            cache,
+            volume=volume.astype(np.float32),
+            mask=mask.astype(np.uint8) if mask is not None else np.zeros((0,), dtype=np.uint8),
+        )
     return volume.astype(np.float32), mask
 
 
